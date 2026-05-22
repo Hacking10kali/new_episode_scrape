@@ -1,0 +1,43 @@
+name: new_episode_scrape
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install -q playwright aiohttp firebase-admin
+          playwright install chromium --with-deps
+
+      - name: Firebase credentials
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          echo "$FIREBASE_SA" > "$RUNNER_TEMP/firebase-sa.json"
+          echo "FIREBASE_SERVICE_ACCOUNT=$RUNNER_TEMP/firebase-sa.json" >> $GITHUB_ENV
+
+      - name: Run scraper
+        env:
+          EPISODE_DELAY: "0.25"
+        run: python new_episode_scrape.py
+
+      - name: Save sync state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sync_state.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "sync_state [$(date -u +'%Y-%m-%d %H:%M')]"
+          git pull --rebase origin main 2>/dev/null || true
+          git push 2>/dev/null || true
