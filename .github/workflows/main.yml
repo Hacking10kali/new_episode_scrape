@@ -21,15 +21,9 @@ jobs:
           pip install -q playwright aiohttp firebase-admin
           playwright install chromium --with-deps
 
-      - name: Firebase credentials
-        env:
-          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          echo "$FIREBASE_SA" > "$RUNNER_TEMP/firebase-sa.json"
-          echo "FIREBASE_SERVICE_ACCOUNT=$RUNNER_TEMP/firebase-sa.json" >> $GITHUB_ENV
-
       - name: Run scraper
         env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           EPISODE_DELAY: "0.25"
         run: python new_episode_scrape.py
 
