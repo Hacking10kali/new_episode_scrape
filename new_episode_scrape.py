@@ -173,21 +173,42 @@ def merge_episodes_into_chunks(existing_chunks: list, new_episodes: list):
     return writes, True
 
 
+def _load_firebase_service_account() -> dict:
+    """Charge le JSON service account depuis l'env ou un fichier."""
+    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip().lstrip("\ufeff")
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"FIREBASE_SERVICE_ACCOUNT_JSON invalide: {exc}") from exc
+
+    for key in ("GOOGLE_APPLICATION_CREDENTIALS", "FIREBASE_SERVICE_ACCOUNT"):
+        path = os.environ.get(key, "").strip()
+        if not path or not os.path.isfile(path):
+            continue
+        text = Path(path).read_text(encoding="utf-8-sig").strip()
+        if not text:
+            continue
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Fichier Firebase invalide ({path}): {exc}") from exc
+
+    raise RuntimeError(
+        "Credentials Firebase manquants. "
+        "Définir FIREBASE_SERVICE_ACCOUNT_JSON (JSON complet) ou FIREBASE_SERVICE_ACCOUNT (chemin fichier)."
+    )
+
+
 def init_firestore():
     import firebase_admin
     from firebase_admin import credentials, firestore
 
     if firebase_admin._apps:
         return firestore.client()
-    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    sa_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
-    if sa_json:
-        cred = credentials.Certificate(json.loads(sa_json))
-    elif sa_path and os.path.isfile(sa_path):
-        cred = credentials.Certificate(sa_path)
-    else:
-        cred = None
-    firebase_admin.initialize_app(cred) if cred else firebase_admin.initialize_app()
+
+    cred = credentials.Certificate(_load_firebase_service_account())
+    firebase_admin.initialize_app(cred)
     return firestore.client()
 
 
@@ -744,13 +765,15 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
-    if not args.dry_run and not (
-        os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-        or os.environ.get("FIREBASE_SERVICE_ACCOUNT")
-        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    ):
-        print("ERROR: secret Firebase manquant (FIREBASE_SERVICE_ACCOUNT_JSON)", file=sys.stderr)
-        return 2
+    if not args.dry_run:
+        has_json = bool(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip())
+        has_file = any(
+            os.path.isfile(os.environ.get(k, ""))
+            for k in ("FIREBASE_SERVICE_ACCOUNT", "GOOGLE_APPLICATION_CREDENTIALS")
+        )
+        if not has_json and not has_file:
+            print("ERROR: secret Firebase manquant (FIREBASE_SERVICE_ACCOUNT_JSON)", file=sys.stderr)
+            return 2
     asyncio.run(run(args.dry_run, args.force))
     return 0
 
