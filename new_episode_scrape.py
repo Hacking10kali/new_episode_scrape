@@ -780,22 +780,17 @@ async def process_release(browser, session, fs, release, state, force):
         else:
             log(f"  SKIP main release: {key} (Checking other seasons...)")
             
-        # Heal any empty seasons
+        # Heal any empty seasons or migrate/backfill chunks missing fields
         for saison in anime_doc.get("saisons", []):
             if not skip_main and saison.get("id") == sid:
                 continue
             
             s_id = saison.get("id")
             parts = int(saison.get("parts", 0))
-            is_empty = False
-            if parts == 0:
-                is_empty = True
-            else:
-                chunks = fs.get_saison_chunks(s_id, 1)
-                if not chunks:
-                    is_empty = True
-                    
-            if is_empty:
+            
+            chunks = fs.get_saison_chunks(s_id, parts) if parts > 0 else []
+            
+            if not chunks:
                 log(f"    Season {s_id} is empty in Firestore. Re-scraping all episodes...")
                 catalogue_url = f"{BASE_URL}/catalogue/{release['anime_id']}/"
                 s_url = build_saison_url(catalogue_url, saison.get("titreVignette"), saison.get("langue"))
@@ -807,6 +802,34 @@ async def process_release(browser, session, fs, release, state, force):
                             saison.get("titreComplet"), saison.get("langue"), s_eps,
                         )
                         log(f"    Scraped and added {added_s} episodes for empty season {s_id}")
+            else:
+                chunks_to_update = []
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for chunk in chunks:
+                    chunk_id = f"{s_id}_part{chunk.get('part', 1)}"
+                    needs_update = False
+                    
+                    for field in ("animeNom", "animeImage", "animeIds", "langue", "updatedAt"):
+                        if field not in chunk:
+                            needs_update = True
+                            
+                    eps = chunk.get("episodes", [])
+                    for ep in eps:
+                        if "addedAt" not in ep:
+                            ep["addedAt"] = now_iso
+                            needs_update = True
+                            
+                    if needs_update:
+                        chunk["animeNom"] = chunk.get("animeNom") or anime_doc.get("nom")
+                        chunk["animeImage"] = chunk.get("animeImage") or anime_doc.get("image")
+                        chunk["animeIds"] = chunk.get("animeIds") or anime_doc.get("ids")
+                        chunk["langue"] = chunk.get("langue") or saison.get("langue")
+                        chunk["updatedAt"] = chunk.get("updatedAt") or now_iso
+                        chunks_to_update.append((chunk_id, chunk))
+                        
+                if chunks_to_update:
+                    log(f"    Backfilling {len(chunks_to_update)} chunk(s) for season {s_id} with missing fields...")
+                    fs.upsert("saison_chunks", chunks_to_update, merge=True)
         
         return {"status": "skipped" if skip_main else "updated"}
         
