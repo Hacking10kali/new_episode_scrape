@@ -90,18 +90,21 @@ def build_saison_id(anime_id: str, titre_vignette: str, langue: str) -> str:
 
 def scraped_episodes_to_firestore(episodes_in: list, start_num: int = 1) -> list:
     out = []
+    now_iso = datetime.now(timezone.utc).isoformat()
     for i, ep in enumerate(episodes_in):
         raw = ep.get("episode", "")
         out.append({
             "num": parse_episode_num(raw, start_num + i),
             "titre": raw,
             "lecteurs": ep.get("lecteurs", []),
+            "addedAt": ep.get("addedAt") or now_iso,
         })
     return out
 
 
 def anime_doc_from_scraped(anime_data: dict, anime_id: str) -> dict:
     saisons_out = []
+    now_iso = datetime.now(timezone.utc).isoformat()
     for saison in anime_data.get("saisons", []):
         eps = saison.get("episodes", []) or []
         tv = saison.get("titreVignette", "")
@@ -113,6 +116,7 @@ def anime_doc_from_scraped(anime_data: dict, anime_id: str) -> dict:
             "titreComplet": saison.get("titreComplet", tv),
             "langue": lang,
             "parts": math.ceil(len(eps) / MAX_EPISODES_PER_CHUNK) if eps else 0,
+            "updatedAt": saison.get("updatedAt") or now_iso,
         })
     return {
         "nom": anime_data.get("nom"),
@@ -125,14 +129,17 @@ def anime_doc_from_scraped(anime_data: dict, anime_id: str) -> dict:
         "bande_annonce": anime_data.get("bande_annonce"),
         "ids": anime_data.get("ids", {}),
         "saisons": saisons_out,
+        "createdAt": anime_data.get("createdAt") or now_iso,
+        "updatedAt": now_iso,
     }
 
 
-def chunks_from_saison(anime_id: str, saison_id: str, episodes_in: list) -> list:
+def chunks_from_saison(anime_id: str, saison_id: str, episodes_in: list, anime_nom: str = None, anime_image: str = None, anime_ids: dict = None, langue: str = None) -> list:
     if not episodes_in:
         return []
     eps = scraped_episodes_to_firestore(episodes_in)
     writes = []
+    now_iso = datetime.now(timezone.utc).isoformat()
     for part_index in range(math.ceil(len(eps) / MAX_EPISODES_PER_CHUNK)):
         part = part_index + 1
         start = part_index * MAX_EPISODES_PER_CHUNK + 1
@@ -141,11 +148,16 @@ def chunks_from_saison(anime_id: str, saison_id: str, episodes_in: list) -> list
         writes.append((f"{saison_id}_part{part}", {
             "saisonId": saison_id, "animeId": anime_id, "part": part,
             "start": start, "end": end, "episodes": slice_eps, "count": len(slice_eps),
+            "updatedAt": now_iso,
+            "animeNom": anime_nom,
+            "animeImage": anime_image,
+            "animeIds": anime_ids,
+            "langue": langue,
         }))
     return writes
 
 
-def merge_episodes_into_chunks(existing_chunks: list, new_episodes: list):
+def merge_episodes_into_chunks(existing_chunks: list, new_episodes: list, anime_nom: str = None, anime_image: str = None, anime_ids: dict = None, langue: str = None):
     if not new_episodes or not existing_chunks:
         return [], False
     chunks = sorted(existing_chunks, key=lambda c: c.get("part", 0))
@@ -153,14 +165,26 @@ def merge_episodes_into_chunks(existing_chunks: list, new_episodes: list):
     for ch in chunks:
         all_eps.extend(ch.get("episodes", []))
     existing_nums = {int(e["num"]) for e in all_eps}
+    
+    added_any = False
     for ep in new_episodes:
         if int(ep["num"]) not in existing_nums:
             all_eps.append(ep)
-    if len(all_eps) == sum(len(c.get("episodes", [])) for c in chunks):
+            added_any = True
+            
+    if not added_any:
         return [], False
+        
     all_eps.sort(key=lambda e: int(e["num"]))
     sid, aid = chunks[0].get("saisonId", ""), chunks[0].get("animeId", "")
+    
+    nom = anime_nom or chunks[0].get("animeNom")
+    img = anime_image or chunks[0].get("animeImage")
+    ids = anime_ids or chunks[0].get("animeIds")
+    lang = langue or chunks[0].get("langue")
+    
     writes = []
+    now_iso = datetime.now(timezone.utc).isoformat()
     for part_index in range(math.ceil(len(all_eps) / MAX_EPISODES_PER_CHUNK)):
         part = part_index + 1
         start = part_index * MAX_EPISODES_PER_CHUNK + 1
@@ -169,6 +193,11 @@ def merge_episodes_into_chunks(existing_chunks: list, new_episodes: list):
             "saisonId": sid, "animeId": aid, "part": part,
             "start": start, "end": end,
             "episodes": all_eps[start - 1 : end], "count": end - start + 1,
+            "updatedAt": now_iso,
+            "animeNom": nom,
+            "animeImage": img,
+            "animeIds": ids,
+            "langue": lang,
         }))
     return writes, True
 
@@ -251,7 +280,13 @@ class FirestoreSync:
             tv = saison.get("titreVignette", "")
             lang = str(saison.get("langue", "") or "").lower()
             sid = build_saison_id(anime_id, tv, lang)
-            chunk_writes.extend(chunks_from_saison(anime_id, sid, eps))
+            chunk_writes.extend(chunks_from_saison(
+                anime_id, sid, eps,
+                anime_nom=anime_data.get("nom"),
+                anime_image=anime_data.get("image"),
+                anime_ids=anime_data.get("ids"),
+                langue=lang
+            ))
         self.upsert("animes", [(anime_id, anime_doc_from_scraped(anime_data, anime_id))], merge=False)
         self.upsert("saison_chunks", chunk_writes, merge=False)
 
@@ -260,34 +295,55 @@ class FirestoreSync:
         if not anime_doc:
             return 0
         new_eps = scraped_episodes_to_firestore(scraped_eps)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
+        anime_doc["updatedAt"] = now_iso
+        anime_nom = anime_doc.get("nom")
+        anime_image = anime_doc.get("image")
+        anime_ids = anime_doc.get("ids")
+        
         meta = next((s for s in anime_doc.get("saisons", []) if s.get("id") == saison_id), None)
         if meta:
             chunks = self.get_saison_chunks(saison_id, int(meta.get("parts", 0)))
             if not chunks:
-                cw = chunks_from_saison(anime_id, saison_id, scraped_eps)
+                cw = chunks_from_saison(
+                    anime_id, saison_id, scraped_eps,
+                    anime_nom=anime_nom, anime_image=anime_image,
+                    anime_ids=anime_ids, langue=langue
+                )
                 for s in anime_doc["saisons"]:
                     if s["id"] == saison_id:
                         s["parts"] = len(cw)
+                        s["updatedAt"] = now_iso
                 self.upsert("animes", [(anime_id, anime_doc)], merge=True)
                 self.upsert("saison_chunks", cw, merge=False)
                 return len(new_eps)
-            cw, changed = merge_episodes_into_chunks(chunks, new_eps)
+            cw, changed = merge_episodes_into_chunks(
+                chunks, new_eps,
+                anime_nom=anime_nom, anime_image=anime_image,
+                anime_ids=anime_ids, langue=langue
+            )
             if not changed:
                 return 0
             np = max(c[1]["part"] for c in cw)
-            if np != meta.get("parts"):
-                for s in anime_doc["saisons"]:
-                    if s["id"] == saison_id:
-                        s["parts"] = np
-                self.upsert("animes", [(anime_id, anime_doc)], merge=True)
+            for s in anime_doc["saisons"]:
+                if s["id"] == saison_id:
+                    s["parts"] = np
+                    s["updatedAt"] = now_iso
+            self.upsert("animes", [(anime_id, anime_doc)], merge=True)
             before = sum(len(c.get("episodes", [])) for c in chunks)
             self.upsert("saison_chunks", cw, merge=True)
             after = sum(len(c[1].get("episodes", [])) for c in cw)
             return max(0, after - before)
-        cw = chunks_from_saison(anime_id, saison_id, scraped_eps)
+        
+        cw = chunks_from_saison(
+            anime_id, saison_id, scraped_eps,
+            anime_nom=anime_nom, anime_image=anime_image,
+            anime_ids=anime_ids, langue=langue
+        )
         anime_doc.setdefault("saisons", []).append({
             "id": saison_id, "titreVignette": titre_v, "titreComplet": titre_c,
-            "langue": langue.lower(), "parts": len(cw),
+            "langue": langue.lower(), "parts": len(cw), "updatedAt": now_iso
         })
         self.upsert("animes", [(anime_id, anime_doc)], merge=True)
         self.upsert("saison_chunks", cw, merge=False)
@@ -707,19 +763,53 @@ async def scrape_full_anime(browser, session, catalogue_url, card_name="", prefe
 
 async def process_release(browser, session, fs, release, state, force):
     key = f"{release['anime_id']}|{release['segment']}|{release['langue']}"
-    if not force and state.get("processed", {}).get(key) == release["url"]:
-        log(f"  SKIP: {key}")
-        return {"status": "skipped"}
     sid = build_saison_id(release["anime_id"], release["titre_vignette"], release["langue"])
-    if fs.get_anime(release["anime_id"]):
-        log(f"  UPDATE {release['anime_id']} / {sid}")
-        eps = await scrape_saison_episodes(browser, release["url"])
-        added = fs.append_episodes(
-            release["anime_id"], sid, release["titre_vignette"],
-            release["titre_complet"], release["langue"], eps,
-        ) if eps else 0
-        state.setdefault("processed", {})[key] = release["url"]
-        return {"status": "updated", "added": added}
+    
+    skip_main = not force and state.get("processed", {}).get(key) == release["url"]
+    anime_doc = fs.get_anime(release["anime_id"])
+    
+    if anime_doc:
+        if not skip_main:
+            log(f"  UPDATE {release['anime_id']} / {sid}")
+            eps = await scrape_saison_episodes(browser, release["url"])
+            added = fs.append_episodes(
+                release["anime_id"], sid, release["titre_vignette"],
+                release["titre_complet"], release["langue"], eps,
+            ) if eps else 0
+            state.setdefault("processed", {})[key] = release["url"]
+        else:
+            log(f"  SKIP main release: {key} (Checking other seasons...)")
+            
+        # Heal any empty seasons
+        for saison in anime_doc.get("saisons", []):
+            if not skip_main and saison.get("id") == sid:
+                continue
+            
+            s_id = saison.get("id")
+            parts = int(saison.get("parts", 0))
+            is_empty = False
+            if parts == 0:
+                is_empty = True
+            else:
+                chunks = fs.get_saison_chunks(s_id, 1)
+                if not chunks:
+                    is_empty = True
+                    
+            if is_empty:
+                log(f"    Season {s_id} is empty in Firestore. Re-scraping all episodes...")
+                catalogue_url = f"{BASE_URL}/catalogue/{release['anime_id']}/"
+                s_url = build_saison_url(catalogue_url, saison.get("titreVignette"), saison.get("langue"))
+                if s_url:
+                    s_eps = await scrape_saison_episodes(browser, s_url)
+                    if s_eps:
+                        added_s = fs.append_episodes(
+                            release["anime_id"], s_id, saison.get("titreVignette"),
+                            saison.get("titreComplet"), saison.get("langue"), s_eps,
+                        )
+                        log(f"    Scraped and added {added_s} episodes for empty season {s_id}")
+        
+        return {"status": "skipped" if skip_main else "updated"}
+        
     log(f"  CREATE {release['anime_id']}")
     data = await scrape_full_anime(
         browser, session, release["catalogue_url"],
